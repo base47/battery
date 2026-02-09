@@ -67,12 +67,12 @@ trap cleanup EXIT
 
 echo "[  3 ] Downloading latest version of battery CLI"
 # Note: github names zips by <reponame>-<branchname>.replace( '/', '-' )
-update_branch="main"
+update_branch="root-owned-executables-testing"
 in_zip_folder_name="battery-$update_branch"
 batteryfolder="$tempfolder/battery"
 rm -rf $batteryfolder
 mkdir -p $batteryfolder
-curl -sSL -o $batteryfolder/repo.zip "https://github.com/actuallymentor/battery/archive/refs/heads/$update_branch.zip"
+curl -sSL -o $batteryfolder/repo.zip "https://github.com/base47/battery/archive/refs/heads/$update_branch.zip"
 unzip -qq $batteryfolder/repo.zip -d $batteryfolder
 cp -r $batteryfolder/$in_zip_folder_name/* $batteryfolder
 rm $batteryfolder/repo.zip
