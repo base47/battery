@@ -155,11 +155,6 @@ ALL ALL = NOPASSWD: CHARGING_ON
 ALL ALL = NOPASSWD: FORCE_DISCHARGE_OFF
 ALL ALL = NOPASSWD: FORCE_DISCHARGE_ON
 ALL ALL = NOPASSWD: LED_CONTROL
-
-# Temporarily keep passwordless SMC reading commands so the old menubar GUI versions don't ask for password on each launch
-# trying to execute 'battery visudo'. There is no harm in removing this, so do it as soon as you believe users are no
-# longer using old versions.
-ALL ALL = NOPASSWD: $smc_binary -k CH0C -r, $smc_binary -k CH0I -r, $smc_binary -k ACLC -r, $smc_binary -k CHIE -r, $smc_binary -k CHTE -r
 "
 
 # Get parameters
@@ -246,9 +241,12 @@ function smc_write_hex() {
 [[ $($smc_binary -k CHIE -r) =~ "no data" ]] && smc_supports_adapter_chie=false || smc_supports_adapter_chie=true;
 [[ $($smc_binary -k CH0I -r) =~ "no data" ]] && smc_supports_adapter_ch0i=false || smc_supports_adapter_ch0i=true;
 [[ $($smc_binary -k CH0J -r) =~ "no data" || $($smc_binary -k CH0J -r) =~ "Error" ]] && smc_supports_adapter_ch0j=false || smc_supports_adapter_ch0j=true;
+[[ $($smc_binary -k bfD0 -r) == *"(bytes "* &&
+   $($smc_binary -k bfE0 -r) == *"(bytes "* &&
+   $($smc_binary -k bfF0 -r) == *"(bytes "* ]] && smc_supports_bfF0=true || smc_supports_bfF0=false;
 
 function log_smc_capabilities() {
-	log "SMC capabilities: tahoe=$smc_supports_tahoe legacy=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
+	log "SMC capabilities: bfF0=$smc_supports_bfF0 tahoe=$smc_supports_tahoe legacy=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
 }
 
 ## #################
