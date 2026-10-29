@@ -86,6 +86,9 @@ Usage:
     output logs of the battery CLI and GUI
     eg: battery logs 100
 
+  battery dump_smc
+    display values of all SMC registers used by this script
+
   battery maintain PERCENTAGE[1-100,stop] or RANGE[lower-upper]
     reboot-persistent battery level maintenance: turn off charging above, and on below a certain value
     it has the option of a --force-discharge flag that discharges even when plugged in (this does NOT work well with clamshell mode)
@@ -1299,6 +1302,42 @@ if [[ "$action" == "logs" ]]; then
 	echo -e "\n⚙️	Battery data:\n"
 	$battery_binary status
 	$battery_binary | grep -E "v\d.*"
+
+	exit 0
+
+fi
+
+# Display all SMC registers used by this script
+if [[ "$action" == "dump_smc" ]]; then
+
+	limit_bytes_pattern='\(bytes ([[:xdigit:]]{2}) ([[:xdigit:]]{2}) ([[:xdigit:]]{2}) ([[:xdigit:]]{2})\)'
+	for key in bfD0 bfE0 bfF0 CHTE CH0B CH0C CHIE CH0I CH0J ACLC; do
+		smc_output=$("$smc_binary" -k "$key" -r 2>&1)
+		case "$key" in
+			bfD0) meaning="Upper charge limit value (stop charging)" ;;
+			bfE0) meaning="Lower charge limit value (resume charging)" ;;
+			bfF0) meaning="Charge limit control (00: limit disabled; 02: limit enabled)" ;;
+			CHTE) meaning="Legacy charging control (00000000: enabled; 01000000: disabled)" ;;
+			CH0B|CH0C) meaning="Legacy charging control (00: enabled; 02: disabled)" ;;
+			CHIE) meaning="Forced discharge control (00: adapter enabled; 08: adapter disabled)" ;;
+			CH0I|CH0J) meaning="Forced discharge control (00: adapter enabled; 01: adapter disabled)" ;;
+			ACLC) meaning="MagSafe LED control (00: reset; 01: off; 03: green; 04: orange)" ;;
+		esac
+		printf '%-64s  %s' "$smc_output" "$meaning"
+		if [[ "$key" == "bfD0" || "$key" == "bfE0" ]]; then
+			if [[ "$smc_output" =~ $limit_bytes_pattern ]]; then
+				percentage=$((16#${BASH_REMATCH[4]}${BASH_REMATCH[3]}${BASH_REMATCH[2]}${BASH_REMATCH[1]}))
+				if [[ "$percentage" -eq 0 ]]; then
+					printf ', Current Value: not set'
+				else
+					printf ', Current Value: %d%%' "$percentage"
+				fi
+			else
+				printf '  Value: unavailable'
+			fi
+		fi
+		printf '\n'
+	done
 
 	exit 0
 
