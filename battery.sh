@@ -139,6 +139,7 @@ Usage:
 # Purpose:
 # - Allows this script to execute 'sudo smc -w' commands without requiring a user password.
 # - Allows passwordless updates.
+# - Allows passwordless bfF0 charge-limit actions.
 visudoconfig="
 # Visudo settings for the battery utility installed from https://github.com/actuallymentor/battery
 # intended to be placed in $visudo_file on a mac
@@ -146,6 +147,10 @@ visudoconfig="
 # Allow passwordless update (All battery app executables are owned by root to prevent privilege escalation attacks)
 ALL ALL = NOPASSWD: $battery_binary update_silent
 ALL ALL = NOPASSWD: $battery_binary update_silent is_enabled
+
+# Allow passwordless bfF0 charge-limit actions
+ALL ALL = NOPASSWD: $battery_binary _set_charge_limit_bfF0 *
+ALL ALL = NOPASSWD: $battery_binary _reset_charge_limit_bfF0
 
 # Allow passwordless battery-charging–related SMC write commands
 Cmnd_Alias    CHARGING_OFF = $smc_binary -k CH0B -w 02, $smc_binary -k CH0C -w 02, $smc_binary -k CHTE -w 01000000
@@ -217,7 +222,7 @@ function valid_voltage() {
 }
 
 function smc_read_hex() {
-	key=$1
+	local key=$1 line
 	line=$(echo $($smc_binary -k $key -r))
 	if [[ $line =~ "no data" ]]; then
 		echo
@@ -229,9 +234,17 @@ function smc_read_hex() {
 function smc_write_hex() {
 	local key=$1
 	local hex_value=$2
+	local actual expected
 	if ! sudo $smc_binary -k "$key" -w "$hex_value" >/dev/null 2>&1; then
 		log "⚠️ Failed to write $hex_value to $key"
 		return 1
+	fi
+	expected=$(printf '%s' "$hex_value" | tr '[:lower:]' '[:upper:]')
+	actual=$(smc_read_hex "$key" | tr '[:lower:]' '[:upper:]')
+	if [[ -z "$actual" ]]; then
+		log "⚠️ Unable to verify $key after writing $hex_value"
+	elif [[ "$actual" != "$expected" ]]; then
+		log "⚠️ Failed to verify $key: wrote $expected, read $actual"
 	fi
 	return 0
 }
@@ -249,7 +262,7 @@ function smc_write_hex() {
    $($smc_binary -k bfF0 -r) == *"(bytes "* ]] && smc_supports_bfF0=true || smc_supports_bfF0=false;
 
 function log_smc_capabilities() {
-	log "SMC capabilities: bfF0=$smc_supports_bfF0 tahoe=$smc_supports_tahoe legacy=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
+	log "SMC capabilities: bfF0=$smc_supports_bfF0 CHTE=$smc_supports_tahoe CH0B=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
 }
 
 ## #################
@@ -273,6 +286,23 @@ function change_magsafe_led_color() {
 		# Default action: reset. Value 00 is a guess and needs confirmation
 		log "resetting LED"
 		sudo $smc_binary -k ACLC -w 00
+	fi
+}
+
+# Enables charging by resetting SMC registers to their default values.
+function enable_charging_smc() {
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		sudo -n "$battery_binary" _reset_charge_limit_bfF0
+	elif [[ "$smc_supports_tahoe" == "true" ]]; then
+		smc_write_hex CHTE 00000000
+	elif [[ "$smc_supports_legacy" == "true" ]]; then
+		# Re:charging, Aldente uses CH0B https://github.com/davidwernhart/AlDente/blob/0abfeafbd2232d16116c0fe5a6fbd0acb6f9826b/AlDente/Helper.swift#L227
+		# but @joelucid uses CH0C https://github.com/davidwernhart/AlDente/issues/52#issuecomment-1019933570
+		# so I'm using both since with only CH0B I noticed sometimes during sleep it does trigger charging
+		smc_write_hex CH0B 00
+		smc_write_hex CH0C 00
+	else
+		log "⚠️ Unable to reset charging state"
 	fi
 }
 
@@ -307,15 +337,7 @@ function disable_discharging() {
 	if ! valid_percentage "$setting"; then
 
 		log "Disabling discharging: No valid maintain percentage set, enabling charging"
-		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
-			log "⚠️ Unable to reset charging state"
-		fi
+		enable_charging_smc
 		change_magsafe_led_color "orange"
 
 	elif [[ "$battery_percentage" -ge "$setting" && "$is_charging" == "enabled" ]]; then
@@ -327,15 +349,7 @@ function disable_discharging() {
 	elif [[ "$battery_percentage" -lt "$setting" && "$is_charging" == "disabled" ]]; then
 
 		log "Disabling discharging: Charge below $setting, enabling charging"
-		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
-			log "⚠️ Unable to reset charging state"
-		fi
+		enable_charging_smc
 		change_magsafe_led_color "orange"
 
 	fi
@@ -343,25 +357,23 @@ function disable_discharging() {
 	battery_percentage=$(get_battery_percentage)
 }
 
-# Re:charging, Aldente uses CH0B https://github.com/davidwernhart/AlDente/blob/0abfeafbd2232d16116c0fe5a6fbd0acb6f9826b/AlDente/Helper.swift#L227
-# but @joelucid uses CH0C https://github.com/davidwernhart/AlDente/issues/52#issuecomment-1019933570
-# so I'm using both since with only CH0B I noticed sometimes during sleep it does trigger charging
 function enable_charging() {
 	log "🔌🔋 Enabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		smc_write_hex CHTE 00000000
-	elif [[ "$smc_supports_legacy" == "true" ]]; then
-		smc_write_hex CH0B 00
-		smc_write_hex CH0C 00
-	else
-		log "⚠️ Unable to determine SMC keys for enabling charging"
-	fi
+	enable_charging_smc
 	disable_discharging
 }
 
 function disable_charging() {
 	log "🔌🪫 Disabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		local current_charge
+		current_charge=$(get_battery_percentage)
+		if ! sudo -n "$battery_binary" _set_charge_limit_bfF0 "$current_charge"; then
+			log "⚠️ Action execution has failed: _set_charge_limit_bfF0 $current_charge"
+			sudo -n "$battery_binary" _reset_charge_limit_bfF0
+			return 1
+		fi
+	elif [[ "$smc_supports_tahoe" == "true" ]]; then
 		smc_write_hex CHTE 01000000
 	elif [[ "$smc_supports_legacy" == "true" ]]; then
 		smc_write_hex CH0B 02
@@ -371,9 +383,57 @@ function disable_charging() {
 	fi
 }
 
+# Maintain disabled charging using the caller's bounds and charge reading.
+function maintain_disabled_charging() {
+	local range_lower="$1"
+	local range_upper="$2"
+	local current_charge="$3"
+	local ceiling upper lower
+
+	range_lower=$((10#$range_lower))
+	range_upper=$((10#$range_upper))
+	current_charge=$((10#$current_charge))
+
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		# On the 2026 firmware, we disable charging by setting the charging
+		# threshold below or equal to the battery charge level. Setting a
+		# threshold below the current charge can make the firmware discharge
+		# the battery, even with the power adapter connected. To keep the battery
+		# in pass-through mode, we set the charging threshold to the current
+		# battery level and adjust it whenever the battery level changes.
+		#
+		# We set the maximum charging threshold to the higher of 80% or range_upper.
+		# For a 60–70% range, this keeps the battery at 75% if already charged.
+		# At 85%, the threshold is set to 80%, so the battery may discharge to 80%.
+		# If range_upper is above 80%, we use that value as the maximum limit.
+		#
+		# The charging threshold is a function of the current charge and is
+		# calculated using the following formula:
+		#
+		#   threshold = max(range_lower, min(current_charge, max(80, range_upper)))
+		#
+		# When a single percentage is used as a maintenance target, range_lower
+		# and range_upper are equal.
+		#
+		ceiling=$((range_upper > 80 ? range_upper : 80))
+		upper=$((current_charge < ceiling ? current_charge : ceiling))
+		upper=$((upper > range_lower ? upper : range_lower))
+		lower=$((upper - 2))
+
+		if ! sudo -n "$battery_binary" _set_charge_limit_bfF0 "$upper"; then
+			log "⚠️ Action execution has failed: _set_charge_limit_bfF0 (adaptive maintenance; no recovery reset)"
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
 function get_smc_charging_status() {
 	local status_key="CH0B"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		status_key="bfF0"
+	elif [[ "$smc_supports_tahoe" == "true" ]]; then
 		status_key="CHTE"
 	fi
 	hex_status=$(smc_read_hex "$status_key")
@@ -381,7 +441,13 @@ function get_smc_charging_status() {
 		echo "unknown"
 		return
 	fi
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		case "$hex_status" in
+			00) echo "enabled" ;;
+			02) echo "disabled" ;;
+			*) echo "unknown" ;;
+		esac
+	elif [[ "$smc_supports_tahoe" == "true" ]]; then
 		if [[ "$hex_status" == "00000000" ]]; then
 			echo "enabled"
 		else
@@ -752,6 +818,55 @@ if [[ "$action" == "uninstall" ]]; then
 	exit 0
 fi
 
+# Set an explicit bfF0 charge limit.
+if [[ "$action" == "_set_charge_limit_bfF0" ]]; then
+
+	assert_running_as_root
+
+	if [[ $# -ne 2 ]] || ! [[ "$setting" =~ ^([2-9][0-9]|100)$ ]]; then
+		log "Error: battery _set_charge_limit_bfF0 requires exactly one integer from 20 to 100"
+		exit 2
+	fi
+
+	upper="$setting"
+	lower=$((upper - 2))
+	printf -v upper_hex '%02x000000' "$upper"
+	printf -v lower_hex '%02x000000' "$lower"
+
+	# Do nothing if the same limits are already set.
+	applied_state=$(smc_read_hex bfF0)
+	applied_upper=$(smc_read_hex bfD0 | tr '[:upper:]' '[:lower:]')
+	applied_lower=$(smc_read_hex bfE0 | tr '[:upper:]' '[:lower:]')
+	if [[ "$applied_state" =~ ^[[:xdigit:]]{2}$ &&
+	      "$applied_upper" =~ ^[[:xdigit:]]{8}$ &&
+	      "$applied_lower" =~ ^[[:xdigit:]]{8}$ ]]; then
+		if [[ "$applied_state" == "02" && "$applied_upper" == "$upper_hex" && "$applied_lower" == "$lower_hex" ]]; then
+            log "☑️ _set_charge_limit_bfF0: requested charge limit is already set. Do nothing."
+			exit 0
+		fi
+	else
+		log "⚠️ Unable to read bfF0 charge-control settings; attempting to apply desired limits"
+	fi
+
+	smc_write_hex bfF0 00 &&
+	smc_write_hex bfE0 "$lower_hex" &&
+	smc_write_hex bfD0 "$upper_hex" &&
+	smc_write_hex bfF0 02
+	exit $?
+fi
+
+# Resets bfF0 charge-limit control and threshold registers to default values
+if [[ "$action" == "_reset_charge_limit_bfF0" ]]; then
+
+	assert_running_as_root
+
+	result=0
+	smc_write_hex bfF0 00 || exit 1
+	smc_write_hex bfD0 00000000 || result=1
+	smc_write_hex bfE0 00000000 || result=1
+	exit "$result"
+fi
+
 # Charging on/off controller
 if [[ "$action" == "charging" ]]; then
 
@@ -946,25 +1061,35 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		log "Charging to and maintaining at $setting% from $battery_percentage%"
 	fi
 
-	# Loop until battery percent is exceeded
+	# Maintenance Loop
 	while true; do
 
 		# Keep track of status
 		is_charging=$(get_smc_charging_status)
-		ac_attached=$(get_charger_state)
 
-		if [[ "$battery_percentage" -ge "$upper_bound" && ("$is_charging" == "enabled" || "$ac_attached" == "1") ]]; then
+		if [[ "$battery_percentage" -ge "$upper_bound" ]]; then
 
-			log "Charge at or above $upper_bound%"
+			log "Charge level ($battery_percentage%) is at or above upper bound ($upper_bound%)"
 			if [[ "$is_charging" == "enabled" ]]; then
 				disable_charging
 			fi
+			maintain_disabled_charging "$lower_bound" "$upper_bound" "$battery_percentage"
 			change_magsafe_led_color "green"
 
-		elif [[ "$battery_percentage" -lt "$lower_bound" && "$is_charging" == "disabled" ]]; then
+		elif [[ "$battery_percentage" -ge "$lower_bound"  ]]; then
 
-			log "Charge below $lower_bound%"
-			enable_charging
+			log "Charge level ($battery_percentage%) is in betweeen $lower_bound% and $upper_bound%"
+			if [[ "$is_charging" == "disabled" ]]; then
+				maintain_disabled_charging "$lower_bound" "$upper_bound" "$battery_percentage"
+				change_magsafe_led_color "green"
+			fi
+
+		else
+
+			log "Charge level ($battery_percentage%) is below lower bound ($lower_bound%)"
+			if [[ "$is_charging" == "disabled" ]]; then
+				enable_charging
+			fi
 			change_magsafe_led_color "orange"
 
 		fi
