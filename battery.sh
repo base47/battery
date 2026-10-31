@@ -28,6 +28,9 @@ daemon_path=$HOME/Library/LaunchAgents/battery.plist
 calibrate_pidfile=$configfolder/calibrate.pid
 path_configfile=/etc/paths.d/50-battery
 
+# Percentage limits
+percentage_min="20"
+
 # Voltage limits
 voltage_min="10.5"
 voltage_max="12.6"
@@ -89,7 +92,7 @@ Usage:
   battery dump_smc
     display values of all SMC registers used by this script
 
-  battery maintain PERCENTAGE[1-100,stop] or RANGE[lower-upper]
+  battery maintain PERCENTAGE[${percentage_min}-100,stop] or RANGE[lower-upper]
     reboot-persistent battery level maintenance: turn off charging above, and on below a certain value
     it has the option of a --force-discharge flag that discharges even when plugged in (this does NOT work well with clamshell mode)
     eg: battery maintain 80           # maintain at 80%
@@ -104,6 +107,8 @@ Usage:
 
   battery charging SETTING[on/off]
     manually set the battery to (not) charge
+    on macOS releases since 2026, charging can resume after charge level drops.
+    'battery charging off' does not work if charge level is below ${percentage_min}%
     eg: battery charging on
 
   battery adapter SETTING[on/off]
@@ -115,7 +120,7 @@ Usage:
     battery maintenance is restored upon completion
     menubar battery app execution and/or battery maintain command will interrupt calibration
 
-  battery charge LEVEL[1-100]
+  battery charge LEVEL[${percentage_min}-100]
     charge the battery to a certain percentage; battery maintenance is restored upon completion
     eg: battery charge 90
 
@@ -186,7 +191,11 @@ function valid_percentage() {
 	fi
 }
 
-function valid_percentage_range() {
+function valid_maintenance_percentage() {
+	valid_percentage "$1" && [[ "$1" -ge "$percentage_min" ]]
+}
+
+function valid_maintenance_percentage_range() {
 	# Check if input matches range format: NUMBER-NUMBER
 	if ! [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; then
 		return 1
@@ -196,18 +205,13 @@ function valid_percentage_range() {
 	local lower="${1%-*}"
 	local upper="${1#*-}"
 
-	# Validate both numbers are valid percentages
-	if ! valid_percentage "$lower" || ! valid_percentage "$upper"; then
+	# Validate both numbers are valid maintenance percentages
+	if ! valid_maintenance_percentage "$lower" || ! valid_maintenance_percentage "$upper"; then
 		return 1
 	fi
 
 	# Check lower < upper
 	if [[ "$lower" -ge "$upper" ]]; then
-		return 1
-	fi
-
-	# Check bounds are reasonable (lower >= 10, upper <= 100)
-	if [[ "$lower" -lt 10 ]] || [[ "$upper" -gt 100 ]]; then
 		return 1
 	fi
 
@@ -823,8 +827,8 @@ if [[ "$action" == "_set_charge_limit_bfF0" ]]; then
 
 	assert_running_as_root
 
-	if [[ $# -ne 2 ]] || ! [[ "$setting" =~ ^([2-9][0-9]|100)$ ]]; then
-		log "Error: battery _set_charge_limit_bfF0 requires exactly one integer from 20 to 100"
+	if [[ $# -ne 2 ]] || ! [[ "$setting" =~ ^(0|[1-9][0-9]?|100)$ ]] || [[ "$setting" -lt "$percentage_min" ]]; then
+		log " ❌ Error: battery _set_charge_limit_bfF0 requires exactly one integer from ${percentage_min} to 100"
 		exit 2
 	fi
 
@@ -1026,18 +1030,18 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 	upper_bound=""
 	is_range=false
 
-	if valid_percentage_range "$setting"; then
+	if valid_maintenance_percentage_range "$setting"; then
 		# Range format: lower-upper
 		is_range=true
 		lower_bound="${setting%-*}"
 		upper_bound="${setting#*-}"
-	elif valid_percentage "$setting"; then
+	elif valid_maintenance_percentage "$setting"; then
 		# Single value format (backward compatible)
 		is_range=false
 		lower_bound="$setting"
 		upper_bound="$setting"
 	else
-		log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, or a range like 70-80"
+		log " ❌ Error: $setting is not a valid setting for battery maintain. Please use a number between ${percentage_min} and 100, or a range like 70-80"
 		exit 1
 	fi
 
@@ -1206,11 +1210,11 @@ if [[ "$action" == "maintain" ]]; then
 		is_voltage=true
 
 	# Check if setting is a percentage range or single value
-	elif ! valid_percentage "$setting" && ! valid_percentage_range "$setting"; then
+	elif ! valid_maintenance_percentage "$setting" && ! valid_maintenance_percentage_range "$setting"; then
 		log "Called with $setting $action"
 		# If setting is not a valid percentage/range and not a special keyword, exit with an error.
 		if ! { [[ "$setting" == "stop" ]] || [[ "$setting" == "recover" ]]; }; then
-			log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, a range like 70-80, or an action keyword like 'stop' or 'recover'."
+			log " ❌ Error: $setting is not a valid setting for battery maintain. Please use a number between ${percentage_min} and 100, a range like 70-80, or an action keyword like 'stop' or 'recover'."
 			exit 1
 		fi
 
@@ -1221,7 +1225,7 @@ if [[ "$action" == "maintain" ]]; then
 		log "Starting battery maintenance at ${setting}V ±${subsetting}V"
 		nohup $battery_binary maintain_voltage_synchronous $setting $subsetting >>$logfile &
 	else
-		if valid_percentage_range "$setting"; then
+		if valid_maintenance_percentage_range "$setting"; then
 			log "Starting battery maintenance between ${setting/-/% and }%"
 		else
 			log "Starting battery maintenance at $setting% $subsetting"
@@ -1245,7 +1249,7 @@ if [[ "$action" == "maintain" ]]; then
 		else
 			log "Writing new setting $setting to $maintain_percentage_tracker_file"
 			echo $setting >$maintain_percentage_tracker_file
-			if valid_percentage_range "$setting"; then
+			if valid_maintenance_percentage_range "$setting"; then
 				log "Maintaining battery between ${setting/-/% and }%"
 			else
 				log "Maintaining battery at $setting%"
@@ -1308,7 +1312,7 @@ if [[ "$action" == "status" ]]; then
 	if test -f $pidfile; then
 		maintain_percentage=$(cat $maintain_percentage_tracker_file 2>/dev/null)
 		if [[ $maintain_percentage ]]; then
-			if valid_percentage_range "$maintain_percentage"; then
+			if valid_maintenance_percentage_range "$maintain_percentage"; then
 				maintain_level="${maintain_percentage/-/% - }%"
 			else
 				maintain_level="$maintain_percentage%"
