@@ -28,6 +28,9 @@ daemon_path=$HOME/Library/LaunchAgents/battery.plist
 calibrate_pidfile=$configfolder/calibrate.pid
 path_configfile=/etc/paths.d/50-battery
 
+# Percentage limits
+percentage_min="20"
+
 # Voltage limits
 voltage_min="10.5"
 voltage_max="12.6"
@@ -45,6 +48,11 @@ voltage_hyst_max="2"
 binfolder="/usr/local/co.palokaj.battery"
 battery_binary="$binfolder/battery"
 smc_binary="$binfolder/smc"
+
+# Fixed absolute paths to system tools.
+sw_vers_binary="/usr/bin/sw_vers"
+defaults_binary="/usr/bin/defaults"
+notifyutil_binary="/usr/bin/notifyutil"
 
 # GitHub URLs for setup and updates.
 # Temporarily set to your username and branch to test update functionality with your fork.
@@ -86,7 +94,10 @@ Usage:
     output logs of the battery CLI and GUI
     eg: battery logs 100
 
-  battery maintain PERCENTAGE[1-100,stop] or RANGE[lower-upper]
+  battery dump_controls
+    display SMC controls and, on macOS Tahoe 26 and later, native charge-limit preferences
+
+  battery maintain PERCENTAGE[${percentage_min}-100,stop] or RANGE[lower-upper]
     reboot-persistent battery level maintenance: turn off charging above, and on below a certain value
     it has the option of a --force-discharge flag that discharges even when plugged in (this does NOT work well with clamshell mode)
     eg: battery maintain 80           # maintain at 80%
@@ -101,6 +112,8 @@ Usage:
 
   battery charging SETTING[on/off]
     manually set the battery to (not) charge
+    on macOS releases since 2026, charging can resume after charge level drops.
+    'battery charging off' does not work if charge level is below ${percentage_min}%
     eg: battery charging on
 
   battery adapter SETTING[on/off]
@@ -112,7 +125,7 @@ Usage:
     battery maintenance is restored upon completion
     menubar battery app execution and/or battery maintain command will interrupt calibration
 
-  battery charge LEVEL[1-100]
+  battery charge LEVEL[${percentage_min}-100]
     charge the battery to a certain percentage; battery maintenance is restored upon completion
     eg: battery charge 90
 
@@ -136,6 +149,7 @@ Usage:
 # Purpose:
 # - Allows this script to execute 'sudo smc -w' commands without requiring a user password.
 # - Allows passwordless updates.
+# - Allows passwordless mcl_smc and mcl_prefs charge-limit actions and scoped preference reads.
 visudoconfig="
 # Visudo settings for the battery utility installed from https://github.com/actuallymentor/battery
 # intended to be placed in $visudo_file on a mac
@@ -143,6 +157,16 @@ visudoconfig="
 # Allow passwordless update (All battery app executables are owned by root to prevent privilege escalation attacks)
 ALL ALL = NOPASSWD: $battery_binary update_silent
 ALL ALL = NOPASSWD: $battery_binary update_silent is_enabled
+
+# Allow passwordless mcl_smc charge-limit actions
+ALL ALL = NOPASSWD: $battery_binary _set_charge_limit_mcl_smc *
+ALL ALL = NOPASSWD: $battery_binary _reset_charge_limit_mcl_smc
+
+# Allow passwordless mcl_prefs charge-limit actions and root preference reads
+ALL ALL = NOPASSWD: $battery_binary _set_charge_limit_mcl_prefs *
+ALL ALL = NOPASSWD: $battery_binary _reset_charge_limit_mcl_prefs
+ALL ALL = NOPASSWD: $defaults_binary read com.apple.smartcharging.topoffprotection MCLFeatureState
+ALL ALL = NOPASSWD: $defaults_binary read com.apple.smartcharging.topoffprotection mclLimitValue
 
 # Allow passwordless battery-charging–related SMC write commands
 Cmnd_Alias    CHARGING_OFF = $smc_binary -k CH0B -w 02, $smc_binary -k CH0C -w 02, $smc_binary -k CHTE -w 01000000
@@ -155,11 +179,6 @@ ALL ALL = NOPASSWD: CHARGING_ON
 ALL ALL = NOPASSWD: FORCE_DISCHARGE_OFF
 ALL ALL = NOPASSWD: FORCE_DISCHARGE_ON
 ALL ALL = NOPASSWD: LED_CONTROL
-
-# Temporarily keep passwordless SMC reading commands so the old menubar GUI versions don't ask for password on each launch
-# trying to execute 'battery visudo'. There is no harm in removing this, so do it as soon as you believe users are no
-# longer using old versions.
-ALL ALL = NOPASSWD: $smc_binary -k CH0C -r, $smc_binary -k CH0I -r, $smc_binary -k ACLC -r, $smc_binary -k CHIE -r, $smc_binary -k CHTE -r
 "
 
 # Get parameters
@@ -183,7 +202,11 @@ function valid_percentage() {
 	fi
 }
 
-function valid_percentage_range() {
+function valid_maintenance_percentage() {
+	valid_percentage "$1" && [[ "$1" -ge "$percentage_min" ]]
+}
+
+function valid_maintenance_percentage_range() {
 	# Check if input matches range format: NUMBER-NUMBER
 	if ! [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; then
 		return 1
@@ -193,18 +216,13 @@ function valid_percentage_range() {
 	local lower="${1%-*}"
 	local upper="${1#*-}"
 
-	# Validate both numbers are valid percentages
-	if ! valid_percentage "$lower" || ! valid_percentage "$upper"; then
+	# Validate both numbers are valid maintenance percentages
+	if ! valid_maintenance_percentage "$lower" || ! valid_maintenance_percentage "$upper"; then
 		return 1
 	fi
 
 	# Check lower < upper
 	if [[ "$lower" -ge "$upper" ]]; then
-		return 1
-	fi
-
-	# Check bounds are reasonable (lower >= 10, upper <= 100)
-	if [[ "$lower" -lt 10 ]] || [[ "$upper" -gt 100 ]]; then
 		return 1
 	fi
 
@@ -218,8 +236,23 @@ function valid_voltage() {
 	return 1
 }
 
+function read_and_validate_pidfile() {
+	local pidfile="$1" argument_pattern="$2" pid command
+	[[ -f "$pidfile" ]] || return 1
+	pid=$(cat "$pidfile") || return 1
+	if [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != "1" ]]; then
+		command=$(ps -ww -p "$pid" -o command=)
+		if [[ "$command" =~ ^/bin/bash[[:space:]]+.*/battery[[:space:]]+$argument_pattern ]]; then
+			echo "$pid"
+			return 0
+		fi
+	fi
+	rm -f "$pidfile"
+	return 1
+}
+
 function smc_read_hex() {
-	key=$1
+	local key=$1 line
 	line=$(echo $($smc_binary -k $key -r))
 	if [[ $line =~ "no data" ]]; then
 		echo
@@ -231,9 +264,17 @@ function smc_read_hex() {
 function smc_write_hex() {
 	local key=$1
 	local hex_value=$2
+	local actual expected
 	if ! sudo $smc_binary -k "$key" -w "$hex_value" >/dev/null 2>&1; then
 		log "⚠️ Failed to write $hex_value to $key"
 		return 1
+	fi
+	expected=$(printf '%s' "$hex_value" | tr '[:lower:]' '[:upper:]')
+	actual=$(smc_read_hex "$key" | tr '[:lower:]' '[:upper:]')
+	if [[ -z "$actual" ]]; then
+		log "⚠️ Unable to verify $key after writing $hex_value"
+	elif [[ "$actual" != "$expected" ]]; then
+		log "⚠️ Failed to verify $key: wrote $expected, read $actual"
 	fi
 	return 0
 }
@@ -241,37 +282,162 @@ function smc_write_hex() {
 ## #########################
 ## Detect supported SMC keys
 ## #########################
-[[ $($smc_binary -k CHTE -r) =~ "no data" ]] && smc_supports_tahoe=false || smc_supports_tahoe=true;
-[[ $($smc_binary -k CH0B -r) =~ "no data" ]] && smc_supports_legacy=false || smc_supports_legacy=true;
-[[ $($smc_binary -k CHIE -r) =~ "no data" ]] && smc_supports_adapter_chie=false || smc_supports_adapter_chie=true;
-[[ $($smc_binary -k CH0I -r) =~ "no data" ]] && smc_supports_adapter_ch0i=false || smc_supports_adapter_ch0i=true;
-[[ $($smc_binary -k CH0J -r) =~ "no data" || $($smc_binary -k CH0J -r) =~ "Error" ]] && smc_supports_adapter_ch0j=false || smc_supports_adapter_ch0j=true;
+function smc_key_available() {
+	[[ $("$smc_binary" -k "$1" -r) == *"(bytes "* ]]
+}
+smc_key_available CHTE && smc_supports_CHTE=true || smc_supports_CHTE=false
+smc_key_available CH0B && smc_supports_CH0B=true || smc_supports_CH0B=false
+smc_key_available CHIE && smc_supports_adapter_chie=true || smc_supports_adapter_chie=false
+smc_key_available CH0I && smc_supports_adapter_ch0i=true || smc_supports_adapter_ch0i=false
+smc_key_available CH0J && smc_supports_adapter_ch0j=true || smc_supports_adapter_ch0j=false
+smc_key_available ACLC && smc_supports_ACLC=true || smc_supports_ACLC=false
+smc_key_available bfD0 &&
+smc_key_available bfE0 &&
+smc_key_available bfF0 && smc_supports_bfF0=true || smc_supports_bfF0=false
 
-function log_smc_capabilities() {
-	log "SMC capabilities: tahoe=$smc_supports_tahoe legacy=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
+## ###############################
+## Detect charging control backend
+## ###############################
+
+# On macOS Tahoe 26 and later:
+#   - Try using mcl_smc and fall back to mcl_prefs if mcl_smc is unavailable.
+# On macOS Sequoia 15 and earlier:
+#   - Try using mcl_smc and fall back to legacy controls if mcl_smc is unavailable.
+function detect_charging_backend() {
+	local macos_version macos_major
+	macos_version=$("$sw_vers_binary" -productVersion) || macos_version=""
+	macos_major="${macos_version%%.*}"
+
+	if [[ "$smc_supports_bfF0" == "true" ]]; then
+		echo "mcl_smc"
+	elif [[ "$macos_major" =~ ^[0-9]+$ ]] && [[ "$macos_major" -ge 26 ]]; then
+		echo "mcl_prefs"
+	elif [[ "$smc_supports_CHTE" == "true" ]]; then
+		echo "CHTE"
+	elif [[ "$smc_supports_CH0B" == "true" ]]; then
+		echo "CH0B"
+	fi
 }
 
-## #################
-## SMC Manipulation
-## #################
+charging_backend="$(detect_charging_backend)"
 
-# Change magsafe color
+function log_system_capabilities() {
+	log "Battery ${BATTERY_CLI_VERSION}; macOS=$($sw_vers_binary -productVersion); Charging backend=$charging_backend"
+	log "SMC capabilities: bfF0=$smc_supports_bfF0 CHTE=$smc_supports_CHTE CH0B=$smc_supports_CH0B CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j ACLC=$smc_supports_ACLC"
+}
+
+## ####################################################
+## Manual Charge Limit (MCL) helpers
+##   mcl_smc - using bfF0 smc registers family
+##   mcl_prefs - Using macOS defaults and notifications
+## ####################################################
+
+# With the "mcl_smc" and "mcl_prefs" backends, we disable charging by setting the charge limit
+# to the current battery charge level. Setting the limit below the current charge level causes
+# the firmware to discharge the battery, even when the power adapter is connected. To keep the
+# battery in pass-through mode, we set the charge limit to the current charge level and adjust
+# it whenever the charge level changes.
+#
+# By default, the Manual Charge Limit (MCL) is restricted to the range of ${percentage_min}% to 80%.
+# The 80% upper bound can be explicitly overridden by setting a higher maintenance percentage.
+# This default upper bound accounts for occasional macOS battery calibration, during which MCL
+# temporarily stops working and the battery may charge to 100%. Once calibration is completed,
+# the 80% upper bound allows the battery to discharge back to 80%, preventing it from remaining
+# at a high charge level for an extended period without the user noticing. The downside is that
+# the battery may be unnecessarily discharged to 80% after calibration. This is an intentional
+# trade-off to minimize the risk of battery swelling.
+#
+# The limit follows the current charge level between the maintenance range's lower bound and its
+# effective upper bound (at least 80%). Outside this range, the limit is clamped to the nearest
+# bound, allowing the battery to charge or discharge toward it.
+#
+# The charge limit is calculated from the current charge level and the maintenance range using
+# the following formula:
+#
+#   limit = max(range_lower, min(current_charge, max(80, range_upper)))
+#
+# When a single percentage is specified as the maintenance target, range_lower and range_upper
+# are equal.
+function calc_mcl_charge_limit() {
+	local range_lower="$1"
+	local range_upper="$2"
+	local current_charge="$3"
+	local limit
+
+	limit=$((range_upper > 80 ? range_upper : 80))
+	limit=$((current_charge < limit ? current_charge : limit))
+	limit=$((limit > range_lower ? limit : range_lower))
+	echo "$limit"
+}
+
+function apply_mcl_smc_charge_limit() {
+	if ! sudo -n "$battery_binary" _set_charge_limit_mcl_smc "$1"; then
+		log "⚠️ Action execution has failed: _set_charge_limit_mcl_smc $1; attempting recovery reset"
+		if ! sudo -n "$battery_binary" _reset_charge_limit_mcl_smc; then
+			log "⚠️ mcl_smc recovery reset failed; charging state may be partially applied"
+		fi
+		return 1
+	fi
+	return 0
+}
+
+function apply_mcl_prefs_charge_limit() {
+	if ! sudo -n "$battery_binary" _set_charge_limit_mcl_prefs "$1"; then
+		log "⚠️ Action execution has failed: _set_charge_limit_mcl_prefs $1"
+		return 1
+	fi
+	return 0
+}
+
+# Maintain disabled charging using the caller's bounds and charge reading.
+function mcl_maintain_disabled_charging() {
+	if [[ "$charging_backend" != "mcl_smc" && "$charging_backend" != "mcl_prefs" ]]; then
+		return 0
+	fi
+
+	local limit
+	limit=$(calc_mcl_charge_limit "$1" "$2" "$3")
+
+	if [[ "$charging_backend" == "mcl_prefs" ]]; then
+		apply_mcl_prefs_charge_limit "$limit" || return 1
+	elif [[ "$charging_backend" == "mcl_smc" ]]; then
+		apply_mcl_smc_charge_limit "$limit" || return 1
+	fi
+
+	return 0
+}
+
+# Returns success only when the shared notification action detects calibration.
+function mcl_prefs_detect_macos_calibration() {
+	[[ "$charging_backend" == "mcl_prefs" ]] || return 1
+	"$battery_binary" _notify_mcl_prefs_changed >/dev/null 2>&1
+	[[ "$?" -eq 2 ]]
+}
+
+## ###########################################
+## Charging/Discharging Controls Manipulations
+## ###########################################
+
+# Synchronize MagSafe LED state with the current state of charging and discharging controls.
 # see community sleuthing: https://github.com/actuallymentor/battery/issues/71
-function change_magsafe_led_color() {
-	local color=$1
+function update_magsafe_led_color() {
+	[[ "$smc_supports_ACLC" == "true" ]] || return 0
 
-	log "💡 Setting magsafe color to $color"
-
-	if [[ "$color" == "green" ]]; then
-		log "setting LED to green"
-		sudo $smc_binary -k ACLC -w 03
-	elif [[ "$color" == "orange" ]]; then
-		log "setting LED to orange"
-		sudo $smc_binary -k ACLC -w 04
+	if [[ "$(get_discharging_control_status)" == "discharging" ]]; then
+		# Turn the LED off if forced discharging is enabled.
+		smc_write_hex ACLC 01
 	else
-		# Default action: reset. Value 00 is a guess and needs confirmation
-		log "resetting LED"
-		sudo $smc_binary -k ACLC -w 00
+		case "$(get_charging_control_status)" in
+			disabled)
+				# Show green if charging is disabled
+				smc_write_hex ACLC 03 ;;
+			enabled)
+				# Show orange if charging is enabled
+				smc_write_hex ACLC 04 ;;
+			*)
+				# Reset the LED if charging status is unknown
+				smc_write_hex ACLC 00 ;;
+		esac
 	fi
 }
 
@@ -286,7 +452,7 @@ function enable_discharging() {
 	else
 		smc_write_hex CH0I 01
 	fi
-	sudo $smc_binary -k ACLC -w 01
+	update_magsafe_led_color
 }
 
 function disable_discharging() {
@@ -300,100 +466,86 @@ function disable_discharging() {
 	else
 		smc_write_hex CH0I 00
 	fi
-	# Keep track of status
-	is_charging=$(get_smc_charging_status)
-
-	if ! valid_percentage "$setting"; then
-
-		log "Disabling discharging: No valid maintain percentage set, enabling charging"
-		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
-			log "⚠️ Unable to reset charging state"
-		fi
-		change_magsafe_led_color "orange"
-
-	elif [[ "$battery_percentage" -ge "$setting" && "$is_charging" == "enabled" ]]; then
-
-		log "Disabling discharging: Charge above $setting, disabling charging"
-		disable_charging
-		change_magsafe_led_color "green"
-
-	elif [[ "$battery_percentage" -lt "$setting" && "$is_charging" == "disabled" ]]; then
-
-		log "Disabling discharging: Charge below $setting, enabling charging"
-		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
-			log "⚠️ Unable to reset charging state"
-		fi
-		change_magsafe_led_color "orange"
-
-	fi
-
-	battery_percentage=$(get_battery_percentage)
+	update_magsafe_led_color
 }
 
-# Re:charging, Aldente uses CH0B https://github.com/davidwernhart/AlDente/blob/0abfeafbd2232d16116c0fe5a6fbd0acb6f9826b/AlDente/Helper.swift#L227
-# but @joelucid uses CH0C https://github.com/davidwernhart/AlDente/issues/52#issuecomment-1019933570
-# so I'm using both since with only CH0B I noticed sometimes during sleep it does trigger charging
 function enable_charging() {
 	log "🔌🔋 Enabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$charging_backend" == "mcl_smc" ]]; then
+		sudo -n "$battery_binary" _reset_charge_limit_mcl_smc
+	elif [[ "$charging_backend" == "mcl_prefs" ]]; then
+		sudo -n "$battery_binary" _reset_charge_limit_mcl_prefs
+	elif [[ "$charging_backend" == "CHTE" ]]; then
 		smc_write_hex CHTE 00000000
-	elif [[ "$smc_supports_legacy" == "true" ]]; then
+	elif [[ "$charging_backend" == "CH0B" ]]; then
+		# Re:charging, Aldente uses CH0B https://github.com/davidwernhart/AlDente/blob/0abfeafbd2232d16116c0fe5a6fbd0acb6f9826b/AlDente/Helper.swift#L227
+		# but @joelucid uses CH0C https://github.com/davidwernhart/AlDente/issues/52#issuecomment-1019933570
+		# so I'm using both since with only CH0B I noticed sometimes during sleep it does trigger charging
 		smc_write_hex CH0B 00
 		smc_write_hex CH0C 00
 	else
-		log "⚠️ Unable to determine SMC keys for enabling charging"
+		log "⚠️ Unable to reset charging state"
 	fi
 	disable_discharging
+	update_magsafe_led_color
 }
 
 function disable_charging() {
 	log "🔌🪫 Disabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$charging_backend" == "mcl_smc" ]]; then
+		apply_mcl_smc_charge_limit "$(calc_mcl_charge_limit "$percentage_min" 80 "$(get_battery_percentage)")"
+	elif [[ "$charging_backend" == "mcl_prefs" ]]; then
+		apply_mcl_prefs_charge_limit "$(calc_mcl_charge_limit "$percentage_min" 80 "$(get_battery_percentage)")"
+	elif [[ "$charging_backend" == "CHTE" ]]; then
 		smc_write_hex CHTE 01000000
-	elif [[ "$smc_supports_legacy" == "true" ]]; then
+	elif [[ "$charging_backend" == "CH0B" ]]; then
 		smc_write_hex CH0B 02
 		smc_write_hex CH0C 02
 	else
-		log "⚠️ Unable to determine SMC keys for disabling charging"
+		log "⚠️ Unable to determine a backend for disabling charging"
+		return 1
 	fi
+	update_magsafe_led_color
 }
 
-function get_smc_charging_status() {
-	local status_key="CH0B"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		status_key="CHTE"
-	fi
-	hex_status=$(smc_read_hex "$status_key")
-	if [[ -z "$hex_status" ]]; then
-		echo "unknown"
-		return
-	fi
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		if [[ "$hex_status" == "00000000" ]]; then
-			echo "enabled"
-		else
-			echo "disabled"
-		fi
-	elif [[ "$hex_status" == "00" ]]; then
-		echo "enabled"
+# Reports configured charging-control intent, not observed charging activity.
+function get_charging_control_status() {
+	local hex_status
+	if [[ "$charging_backend" == "mcl_prefs" ]]; then
+		local state
+		state=$(sudo -n "$defaults_binary" read "com.apple.smartcharging.topoffprotection" MCLFeatureState 2>/dev/null) || state=""
+		case "$state" in
+			0) echo "enabled" ;;
+			1) echo "disabled" ;;
+			*) echo "unknown" ;;
+		esac
+	elif [[ "$charging_backend" == "mcl_smc" ]]; then
+		hex_status=$(smc_read_hex bfF0)
+		case "$hex_status" in
+			00) echo "enabled" ;;
+			02) echo "disabled" ;;
+			*) echo "unknown" ;;
+		esac
+	elif [[ "$charging_backend" == "CHTE" ]]; then
+		hex_status=$(smc_read_hex CHTE)
+		case "$hex_status" in
+			"") echo "unknown" ;;
+			00000000) echo "enabled" ;;
+			*) echo "disabled" ;;
+		esac
+	elif [[ "$charging_backend" == "CH0B" ]]; then
+		hex_status=$(smc_read_hex CH0B)
+		case "$hex_status" in
+			"") echo "unknown" ;;
+			00) echo "enabled" ;;
+			*) echo "disabled" ;;
+		esac
 	else
-		echo "disabled"
+		echo "unknown"
 	fi
 }
 
-function get_smc_discharging_status() {
+function get_discharging_control_status() {
 	local status_key="CH0I"
 	if [[ "$smc_supports_adapter_chie" == "true" ]]; then
 		status_key="CHIE"
@@ -422,8 +574,9 @@ function get_battery_percentage() {
 }
 
 function get_remaining_time() {
-	time_remaining=$(pmset -g batt | tail -n1 | awk '{print $5}')
-	echo "$time_remaining"
+	pmset -g batt | awk '{
+			for (i = 1; i < NF; i++) if ($i ~ /^[0-9]+:[0-5][0-9]$/ && $(i + 1) == "remaining") remaining = $i
+		} END { print (remaining == "" ? "unknown" : remaining) }'
 }
 
 function get_charger_state() {
@@ -437,8 +590,16 @@ function get_maintain_percentage() {
 }
 
 function get_voltage() {
-	voltage=$(ioreg -l -n AppleSmartBattery -r | grep "\"Voltage\" =" | awk '{ print $3/1000 }' | tr ',' '.')
+	voltage=$(ioreg -l -n AppleSmartBattery -r | LC_ALL=C awk -F= '/^[[:space:]|]*"Voltage"[[:space:]]*=/ { print $2 / 1000 }')
 	echo "$voltage"
+}
+
+function is_maintenance_running() {
+	read_and_validate_pidfile "$pidfile" 'maintain_'
+}
+
+function is_calibration_running() {
+	read_and_validate_pidfile "$calibrate_pidfile" 'calibrate([[:space:]]|$)'
 }
 
 ## ##################
@@ -465,6 +626,12 @@ function determine_unprivileged_user() {
 		username="$(logname 2>/dev/null || true)"
 	fi
 	echo "$username"
+}
+
+function exit_on_error() {
+	[[ "$1" -eq 0 ]] && return 0
+	log "❌ $2"
+	exit 1
 }
 
 function assert_unprivileged_user() {
@@ -751,6 +918,137 @@ if [[ "$action" == "uninstall" ]]; then
 	exit 0
 fi
 
+# Set an explicit mcl_smc charge limit.
+if [[ "$action" == "_set_charge_limit_mcl_smc" ]]; then
+
+	assert_running_as_root
+
+	if [[ $# -ne 2 ]] || ! [[ "$setting" =~ ^(0|[1-9][0-9]?|100)$ ]] || [[ "$setting" -lt "$percentage_min" ]]; then
+		log " ❌ Error: battery $action requires exactly one integer from ${percentage_min} to 100"
+		exit 2
+	fi
+
+	upper="$setting"
+	lower=$((upper - 2))
+	printf -v upper_hex '%02x000000' "$upper"
+	printf -v lower_hex '%02x000000' "$lower"
+
+	# Do nothing if the same limits are already set.
+	applied_state=$(smc_read_hex bfF0)
+	applied_upper=$(smc_read_hex bfD0 | tr '[:upper:]' '[:lower:]')
+	applied_lower=$(smc_read_hex bfE0 | tr '[:upper:]' '[:lower:]')
+	if [[ "$applied_state" =~ ^[[:xdigit:]]{2}$ &&
+		  "$applied_upper" =~ ^[[:xdigit:]]{8}$ &&
+		  "$applied_lower" =~ ^[[:xdigit:]]{8}$ ]]; then
+		if [[ "$applied_state" == "02" && "$applied_upper" == "$upper_hex" && "$applied_lower" == "$lower_hex" ]]; then
+			log "☑️ $action: requested charge limit ("$setting") is already set. Do nothing."
+			exit 0
+		fi
+	else
+		log "⚠️ $action: Unable to read mcl_smc charge-control settings; attempting to apply desired limits"
+	fi
+
+	if smc_write_hex bfF0 00 &&
+	   smc_write_hex bfE0 "$lower_hex" &&
+	   smc_write_hex bfD0 "$upper_hex" &&
+	   smc_write_hex bfF0 02; then
+		log "✅ $action: MCL charge limit is set to $setting%."
+		exit 0
+	fi
+	log "❌ $action: Failed to set MCL charge limit to $setting%. Write sequence stopped."
+	exit 1
+fi
+
+# Reset mcl_smc charge-limit control and threshold registers.
+if [[ "$action" == "_reset_charge_limit_mcl_smc" ]]; then
+
+	assert_running_as_root
+
+	if smc_write_hex bfF0 00 &&
+	   smc_write_hex bfD0 00000000 &&
+	   smc_write_hex bfE0 00000000; then
+		log "✅ $action: MCL charge limit is disabled. Charging requested."
+		exit 0
+	fi
+	log "❌ $action: Failed to disable MCL charge limit. Write sequence stopped."
+	exit 1
+fi
+
+if [[ "$action" == "_set_charge_limit_mcl_prefs" || "$action" == "_reset_charge_limit_mcl_prefs" ]]; then
+
+	assert_running_as_root
+
+	function mcl_prefs_limit_is_already_set() {
+		local applied_state applied_limit
+		applied_state=$("$defaults_binary" read "com.apple.smartcharging.topoffprotection" MCLFeatureState)
+		applied_limit=$("$defaults_binary" read "com.apple.smartcharging.topoffprotection" mclLimitValue)
+		[[ "$applied_state" == "$1" && "$applied_limit" == "$2" ]]
+	}
+
+	function mcl_prefs_write_integer() {
+		local key="$1" value="$2"
+		if ! "$defaults_binary" write "com.apple.smartcharging.topoffprotection" "$key" -int "$value"; then
+			log "⚠️ Failed to write mcl_prefs preference $key=$value"
+		fi
+		return 0
+	}
+
+	# Set an explicit mcl_prefs charge limit in the root preference scope.
+	if [[ "$action" == "_set_charge_limit_mcl_prefs" ]]; then
+		if [[ $# -ne 2 ]] || ! [[ "$setting" =~ ^(0|[1-9][0-9]?|100)$ ]] || [[ "$setting" -lt "$percentage_min" ]]; then
+			log " ❌ Error: battery $action requires exactly one integer from ${percentage_min} to 100"
+			exit 2
+		fi
+		if mcl_prefs_limit_is_already_set 1 "$setting"; then
+			log "☑️ $action: requested charge limit ("$setting") is already set. Do nothing."
+			exit 0
+		fi
+		mcl_prefs_write_integer mclLimitValue "$setting"
+		mcl_prefs_write_integer MCLFeatureState 1
+		"$battery_binary" _notify_mcl_prefs_changed 0.5
+		log "✅ $action: MCL charge limit is set to ("$setting")."
+		exit 0
+	fi
+
+	# Disable MCL and set its percentage setting to 100 (System Settings app does the same when limit is set to 100%)
+	if [[ "$action" == "_reset_charge_limit_mcl_prefs" ]]; then
+		if mcl_prefs_limit_is_already_set 0 100; then
+			log "☑️ $action: requested reset settings are already set. Do nothing."
+			exit 0
+		fi
+		mcl_prefs_write_integer MCLFeatureState 0
+		mcl_prefs_write_integer mclLimitValue 100
+		"$battery_binary" _notify_mcl_prefs_changed 0.5
+		log "✅ $action: MCL charge limit is dissabled. Charging requested."
+		exit 0
+	fi
+fi
+
+# Exits 0 on success, 1 on failure, and 2 when macOS battery calibration is detected.
+if [[ "$action" == "_notify_mcl_prefs_changed" ]]; then
+	sleep "${setting:-0}"
+	output=$("$notifyutil_binary" -p "com.apple.smartcharging.defaultschanged" 2>&1)
+	result=$?
+	if [[ "$result" -ne 0 || -n "$output" ]]; then
+		# Apple's notifyutil can report a posting error on stdout and still exit 0.
+		log "❌ Failed to send the charge limit notification (exit status $result): $output"
+		exit 1
+	fi
+	if ! sleep 1; then
+		log "❌ The wait before checking for macOS battery calibration failed."
+		exit 1
+	fi
+	if ! output=$(/usr/bin/log show --last 2s --style compact --predicate 'process == "PowerUIAgent"'); then
+		log "❌ Failed to read PowerUIAgent logs while checking for macOS battery calibration."
+		exit 1
+	fi
+	if grep -Fiq 'ChargingUpForGauging' <<<"$output"; then
+		log "❌ macOS battery calibration detected. macOS may temporarily override the charge limit and charge the battery to 100%."
+		exit 2
+	fi
+	exit 0
+fi
+
 # Charging on/off controller
 if [[ "$action" == "charging" ]]; then
 
@@ -769,6 +1067,7 @@ if [[ "$action" == "charging" ]]; then
 		exit 1
 	fi
 
+	update_magsafe_led_color
 	exit 0
 
 fi
@@ -791,6 +1090,7 @@ if [[ "$action" == "adapter" ]]; then
 		exit 1
 	fi
 
+	update_magsafe_led_color
 	exit 0
 
 fi
@@ -816,17 +1116,21 @@ if [[ "$action" == "charge" ]]; then
 	# Loop until battery charging level is reached
 	while [[ "$battery_percentage" -lt "$setting" ]]; do
 
+		log "Battery at $battery_percentage% (target $setting%)"
+		update_magsafe_led_color
 		if [[ "$battery_percentage" -ge "$((setting - 3))" ]]; then
 			sleep 20
 		else
 			caffeinate -is sleep 60
 		fi
+		exit_on_error "$?" "Error: Charging wait failed; charging stopped."
 
 		battery_percentage=$(get_battery_percentage)
 
 	done
 
 	disable_charging
+	update_magsafe_led_color
 	log "Charging completed at $battery_percentage%"
 
 	# Try restoring maintenance if invoked by user from Terminal
@@ -860,12 +1164,16 @@ if [[ "$action" == "discharge" ]]; then
 	while [[ "$battery_percentage" -gt "$setting" ]]; do
 
 		log "Battery at $battery_percentage% (target $setting%)"
+		update_magsafe_led_color
 		caffeinate -is sleep 60
+		exit_on_error "$?" "Error: Discharging wait failed; discharging stopped."
 		battery_percentage=$(get_battery_percentage)
 
 	done
 
+	disable_charging
 	disable_discharging
+	update_magsafe_led_color
 	log "Discharging completed at $battery_percentage%"
 
 	# Try restoring maintenance if invoked by user from Terminal
@@ -880,13 +1188,12 @@ fi
 # Maintain at level
 if [[ "$action" == "maintain_synchronous" ]]; then
 
-	log_smc_capabilities
+	log_system_capabilities
 
 	# Checking if the calibration process is running
-	if test -f "$calibrate_pidfile"; then
-		pid=$(cat "$calibrate_pidfile" 2>/dev/null)
-		kill $pid &>/dev/null
-		log "🚨 Calibration process have been stopped"
+	if pid=$(is_calibration_running); then
+		kill "$pid"
+		log "🚨 Calibration process has been stopped"
 	fi
 
 	# Recover old maintain status if old setting is found
@@ -910,18 +1217,18 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 	upper_bound=""
 	is_range=false
 
-	if valid_percentage_range "$setting"; then
+	if valid_maintenance_percentage_range "$setting"; then
 		# Range format: lower-upper
 		is_range=true
 		lower_bound="${setting%-*}"
 		upper_bound="${setting#*-}"
-	elif valid_percentage "$setting"; then
+	elif valid_maintenance_percentage "$setting"; then
 		# Single value format (backward compatible)
 		is_range=false
 		lower_bound="$setting"
 		upper_bound="$setting"
 	else
-		log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, or a range like 70-80"
+		log " ❌ Error: $setting is not a valid setting for battery maintain. Please use a number between ${percentage_min} and 100, or a range like 70-80"
 		exit 1
 	fi
 
@@ -936,7 +1243,7 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		log "Not triggering discharge as it is not requested"
 	fi
 
-	# Start charging
+	# Read the initial charge level
 	battery_percentage=$(get_battery_percentage)
 
 	if [[ "$is_range" == true ]]; then
@@ -945,29 +1252,42 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		log "Charging to and maintaining at $setting% from $battery_percentage%"
 	fi
 
-	# Loop until battery percent is exceeded
+	# Stop charging if current charge level is within specified range
+	if [[ "$battery_percentage" -ge "$lower_bound" && "$battery_percentage" -lt "$upper_bound" ]]; then
+		disable_charging
+	fi
+
+	# Maintenance Loop
 	while true; do
 
 		# Keep track of status
-		is_charging=$(get_smc_charging_status)
-		ac_attached=$(get_charger_state)
+		is_charging=$(get_charging_control_status)
 
-		if [[ "$battery_percentage" -ge "$upper_bound" && ("$is_charging" == "enabled" || "$ac_attached" == "1") ]]; then
+		if [[ "$battery_percentage" -ge "$upper_bound" ]]; then
 
-			log "Charge at or above $upper_bound%"
+			log "Charge level ($battery_percentage%) is at or above upper bound ($upper_bound%)"
 			if [[ "$is_charging" == "enabled" ]]; then
 				disable_charging
 			fi
-			change_magsafe_led_color "green"
+			mcl_maintain_disabled_charging "$lower_bound" "$upper_bound" "$battery_percentage"
 
-		elif [[ "$battery_percentage" -lt "$lower_bound" && "$is_charging" == "disabled" ]]; then
+		elif [[ "$battery_percentage" -ge "$lower_bound"  ]]; then
 
-			log "Charge below $lower_bound%"
-			enable_charging
-			change_magsafe_led_color "orange"
+			log "Charge level ($battery_percentage%) is in betweeen $lower_bound% and $upper_bound%"
+			if [[ "$is_charging" == "disabled" ]]; then
+				mcl_maintain_disabled_charging "$lower_bound" "$upper_bound" "$battery_percentage"
+			fi
+
+		else
+
+			log "Charge level ($battery_percentage%) is below lower bound ($lower_bound%)"
+			if [[ "$is_charging" == "disabled" ]]; then
+				enable_charging
+			fi
 
 		fi
 
+		update_magsafe_led_color
 		sleep 60
 
 		battery_percentage=$(get_battery_percentage)
@@ -981,7 +1301,7 @@ fi
 # Maintain at voltage
 if [[ "$action" == "maintain_voltage_synchronous" ]]; then
 
-	log_smc_capabilities
+	log_system_capabilities
 
 	# Recover old maintain status if old setting is found
 	if [[ "$setting" == "recover" ]]; then
@@ -1005,19 +1325,40 @@ if [[ "$action" == "maintain_voltage_synchronous" ]]; then
 	upper_voltage=$(echo "$setting + $subsetting" | bc -l)
 	log "Keeping voltage between ${lower_voltage}V and ${upper_voltage}V"
 
+	# Stop charging if current voltage is already within specified range
+	if (($(echo "$voltage >= $lower_voltage && $voltage < $upper_voltage" | bc -l))); then
+		disable_charging
+	fi
+
 	# Loop
 	while true; do
-		is_charging=$(get_smc_charging_status)
+		is_charging=$(get_charging_control_status)
 
-		if (($(echo "$voltage < $lower_voltage" | bc -l))) && [[ "$is_charging" == "disabled" ]]; then
-			log "Battery at ${voltage}V"
-			enable_charging
-		fi
-		if (($(echo "$voltage >= $upper_voltage" | bc -l))) && [[ "$is_charging" == "enabled" ]]; then
-			log "Battery at ${voltage}V"
-			disable_charging
+		if (($(echo "$voltage >= $upper_voltage" | bc -l))); then
+
+			log "Battery voltage (${voltage}V) is at or above upper bound (${upper_voltage}V)"
+			if [[ "$is_charging" == "enabled" ]]; then
+				disable_charging
+			fi
+			mcl_maintain_disabled_charging "$percentage_min" "80" "$(get_battery_percentage)"
+
+		elif (($(echo "$voltage >= $lower_voltage" | bc -l))); then
+
+			log "Battery voltage (${voltage}V) is in betweeen ${lower_voltage}V and ${upper_voltage}V"
+			if [[ "$is_charging" == "disabled" ]]; then
+				mcl_maintain_disabled_charging "$percentage_min" "80" "$(get_battery_percentage)"
+			fi
+
+		else
+
+			log "Battery voltage (${voltage}V) is below lower bound (${lower_voltage}V)"
+			if [[ "$is_charging" == "disabled" ]]; then
+				enable_charging
+			fi
+
 		fi
 
+		update_magsafe_led_color
 		sleep 60
 
 		voltage=$(get_voltage)
@@ -1036,21 +1377,19 @@ if [[ "$action" == "maintain" ]]; then
 	disable_discharging
 
 	# Kill old process silently
-	if test -f "$pidfile"; then
-		log "Killing old maintain process at $(cat $pidfile)"
-		pid=$(cat "$pidfile" 2>/dev/null)
-		kill $pid &>/dev/null
+	if pid=$(is_maintenance_running); then
+		log "Killing old maintain process at $pid"
+		kill "$pid"
 	fi
 
-	if test -f "$calibrate_pidfile"; then
-		pid=$(cat "$calibrate_pidfile" 2>/dev/null)
-		kill $pid &>/dev/null
-		log "🚨 Calibration process have been stopped"
+	if pid=$(is_calibration_running); then
+		kill "$pid"
+		log "🚨 Calibration process has been stopped"
 	fi
 
 	if [[ "$setting" == "stop" ]]; then
 		log "Killing running maintain daemons & enabling charging as default state"
-		rm $pidfile 2>/dev/null
+		rm -f "$pidfile"
 		$battery_binary disable_daemon
 		enable_charging
 		$battery_binary status
@@ -1079,12 +1418,15 @@ if [[ "$action" == "maintain" ]]; then
 
 		is_voltage=true
 
+	elif [[ "$setting" == "recover" && -f "$maintain_voltage_tracker_file" ]]; then
+		is_voltage=true
+
 	# Check if setting is a percentage range or single value
-	elif ! valid_percentage "$setting" && ! valid_percentage_range "$setting"; then
+	elif ! valid_maintenance_percentage "$setting" && ! valid_maintenance_percentage_range "$setting"; then
 		log "Called with $setting $action"
 		# If setting is not a valid percentage/range and not a special keyword, exit with an error.
 		if ! { [[ "$setting" == "stop" ]] || [[ "$setting" == "recover" ]]; }; then
-			log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, a range like 70-80, or an action keyword like 'stop' or 'recover'."
+			log " ❌ Error: $setting is not a valid setting for battery maintain. Please use a number between ${percentage_min} and 100, a range like 70-80, or an action keyword like 'stop' or 'recover'."
 			exit 1
 		fi
 
@@ -1092,10 +1434,14 @@ if [[ "$action" == "maintain" ]]; then
 
 	# Start maintenance script
 	if [ "$is_voltage" = true ]; then
-		log "Starting battery maintenance at ${setting}V ±${subsetting}V"
+		if [[ "$setting" == "recover" ]]; then
+			log "Starting voltage maintenance recovery"
+		else
+			log "Starting battery maintenance at ${setting}V ±${subsetting}V"
+		fi
 		nohup $battery_binary maintain_voltage_synchronous $setting $subsetting >>$logfile &
 	else
-		if valid_percentage_range "$setting"; then
+		if valid_maintenance_percentage_range "$setting"; then
 			log "Starting battery maintenance between ${setting/-/% and }%"
 		else
 			log "Starting battery maintenance at $setting% $subsetting"
@@ -1107,7 +1453,7 @@ if [[ "$action" == "maintain" ]]; then
 	echo $! >$pidfile
 	pid=$(cat "$pidfile" 2>/dev/null)
 
-	if ! [[ "$setting" == "recover" ]]; then
+	if [[ "$setting" != "recover" ]]; then
 
 		rm "$maintain_percentage_tracker_file" "$maintain_voltage_tracker_file" 2>/dev/null
 
@@ -1119,7 +1465,7 @@ if [[ "$action" == "maintain" ]]; then
 		else
 			log "Writing new setting $setting to $maintain_percentage_tracker_file"
 			echo $setting >$maintain_percentage_tracker_file
-			if valid_percentage_range "$setting"; then
+			if valid_maintenance_percentage_range "$setting"; then
 				log "Maintaining battery between ${setting/-/% and }%"
 			else
 				log "Maintaining battery at $setting%"
@@ -1142,9 +1488,8 @@ if [[ "$action" == "calibrate" ]]; then
 	$battery_binary maintain stop &>/dev/null
 
 	# Kill old process silently
-	if test -f "$calibrate_pidfile"; then
-		pid=$(cat "$calibrate_pidfile" 2>/dev/null)
-		kill $pid &>/dev/null
+	if pid=$(is_calibration_running); then
+		kill "$pid"
 	fi
 	echo $$ >$calibrate_pidfile
 
@@ -1152,16 +1497,20 @@ if [[ "$action" == "calibrate" ]]; then
 
 	echo "[ 1 ] Discharging battery to 15%"
 	BATTERY_HELPER_MODE=1 $battery_binary discharge 15 &>/dev/null
+	exit_on_error "$?" "Error: Calibration stopped: discharging to 15% failed."
 
 	echo "[ 2 ] Charging to 100%"
 	BATTERY_HELPER_MODE=1 $battery_binary charge 100 &>/dev/null
+	exit_on_error "$?" "Error: Calibration stopped: charging to 100% failed."
 
 	echo "[ 3 ] Reached 100%, waiting for 1 hour"
 	enable_charging &>/dev/null
 	sleep 3600
+	exit_on_error "$?" "Error: Calibration stopped: one-hour wait failed."
 
 	echo "[ 4 ] Discharging battery to 80%"
 	BATTERY_HELPER_MODE=1 $battery_binary discharge 80 &>/dev/null
+	exit_on_error "$?" "Error: Calibration stopped: discharging to 80% failed."
 
 	# Remove pidfile
 	rm -f $calibrate_pidfile
@@ -1178,20 +1527,28 @@ fi
 # Status logger
 if [[ "$action" == "status" ]]; then
 
-	log "Battery at $(get_battery_percentage)% ($(get_remaining_time) remaining), $(get_voltage)V, smc charging $(get_smc_charging_status)"
-	if test -f $pidfile; then
+	log "Battery at $(get_battery_percentage)% ($(get_remaining_time) remaining), $(get_voltage)V, charging set to '$(get_charging_control_status)'"
+	if is_maintenance_running >/dev/null; then
 		maintain_percentage=$(cat $maintain_percentage_tracker_file 2>/dev/null)
 		if [[ $maintain_percentage ]]; then
-			if valid_percentage_range "$maintain_percentage"; then
-				maintain_level="${maintain_percentage/-/% - }%"
+			if valid_maintenance_percentage_range "$maintain_percentage"; then
+				maintain_level="between ${maintain_percentage/-/% and }%"
 			else
-				maintain_level="$maintain_percentage%"
+				maintain_level="at $maintain_percentage%"
 			fi
 		else
 			maintain_level=$(cat $maintain_voltage_tracker_file 2>/dev/null)
-			maintain_level=$(echo "$maintain_level" | awk '{print $1 "V ±" $2 "V"}')
+			maintain_level=$(echo "$maintain_level" | awk '{print "at " $1 " V ±" $2 " V"}')
 		fi
-		log "Your battery is currently being maintained at $maintain_level"
+		log "Your battery is being maintained $maintain_level."
+	else
+		log "Your battery is not being maintained."
+	fi
+	if is_calibration_running >/dev/null; then
+		log "Battery calibration using 'battery calibrate' is in progress."
+	fi
+	if mcl_prefs_detect_macos_calibration; then
+		printf '\033[93m⚠️  macOS battery calibration detected. macOS may temporarily override the charge limit and charge the battery to 100%%.\033[0m\n'
 	fi
 	exit 0
 
@@ -1200,7 +1557,7 @@ fi
 # Status logger in csv format
 if [[ "$action" == "status_csv" ]]; then
 
-	echo "$(get_battery_percentage),$(get_remaining_time),$(get_smc_charging_status),$(get_smc_discharging_status),$(get_maintain_percentage)"
+	echo "$(get_battery_percentage),$(get_remaining_time),$(get_charging_control_status),$(get_discharging_control_status),$(get_maintain_percentage)"
 
 fi
 
@@ -1208,11 +1565,6 @@ fi
 if [[ "$action" == "create_daemon" ]]; then
 
 	assert_not_running_as_root
-
-	call_action="maintain_synchronous"
-	if test -f "$maintain_voltage_tracker_file"; then
-		call_action="maintain_voltage_synchronous"
-	fi
 
 	daemon_definition="
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -1224,7 +1576,7 @@ if [[ "$action" == "create_daemon" ]]; then
 		<key>ProgramArguments</key>
 		<array>
 			<string>$battery_binary</string>
-			<string>$call_action</string>
+			<string>maintain</string>
 			<string>recover</string>
 		</array>
 		<key>StandardOutPath</key>
@@ -1232,6 +1584,10 @@ if [[ "$action" == "create_daemon" ]]; then
 		<key>StandardErrorPath</key>
 		<string>$logfile</string>
 		<key>RunAtLoad</key>
+		<true/>
+		<key>KeepAlive</key>
+		<false/>
+		<key>AbandonProcessGroup</key>
 		<true/>
 	</dict>
 </plist>
@@ -1301,6 +1657,51 @@ if [[ "$action" == "logs" ]]; then
 	echo -e "\n⚙️	Battery data:\n"
 	$battery_binary status
 	$battery_binary | grep -E "v\d.*"
+
+	exit 0
+
+fi
+
+# Display SMC controls and native charge-limit preferences.
+if [[ "$action" == "dump_controls" ]]; then
+
+	function print_smc_control() {
+		local key="$1" description="$2" output byte hex=""
+		output=$("$smc_binary" -k "$key" -r 2>&1)
+		if [[ "$output" =~ \(bytes\ ([[:xdigit:]]{2}(\ [[:xdigit:]]{2})*)\) ]]; then
+			for byte in ${BASH_REMATCH[1]}; do hex="$byte$hex"; done    # Reverse the little-endian
+			description="$description, current decimal value: $((16#$hex))"
+		fi
+		output=${output//$'\n'/ }
+		printf '  %-4s  %-48s  %s\n' "$key" "${output:-(no output)}" "$description"
+	}
+
+	printf 'SMC state:\n'
+	print_smc_control bfD0 "Upper charge limit value (stop charging)"
+	print_smc_control bfE0 "Lower charge limit value (resume charging)"
+	print_smc_control bfF0 "Charge limit control (00: limit disabled; 02: limit enabled)"
+	print_smc_control CHTE "Legacy charging control (00000000: enabled; 01000000: disabled)"
+	print_smc_control CH0B "Legacy charging control (00: enabled; 02: disabled)"
+	print_smc_control CH0C "Legacy charging control (00: enabled; 02: disabled)"
+	print_smc_control CHIE "Forced discharge control (00: adapter enabled; 08: adapter disabled)"
+	print_smc_control CH0I "Forced discharge control (00: adapter enabled; 01: adapter disabled)"
+	print_smc_control CH0J "Forced discharge control (00: adapter enabled; 01: adapter disabled)"
+	print_smc_control ACLC "MagSafe LED control (00: reset; 01: off; 03: green; 04: orange)"
+
+	function print_mcl_prefs_control() {
+		local key="$1" description="$2" value
+		value=$(sudo -n "$defaults_binary" read com.apple.smartcharging.topoffprotection "$key" 2>/dev/null) || value="failed to read the key"
+		printf '  %-16s  %-36s  %s\n' "$key" "$value" "$description"
+	}
+
+	printf '\nPreferences: com.apple.smartcharging.topoffprotection.plist (root scope)\n'
+	print_mcl_prefs_control MCLFeatureState "Charge limit feature state (0: disabled; 1: enabled)"
+	print_mcl_prefs_control mclLimitValue "Charge limit percentage"
+
+	printf '\n'
+	if mcl_prefs_detect_macos_calibration; then
+		printf '\033[93m⚠️  macOS battery calibration detected.\033[0m\n'
+	fi
 
 	exit 0
 
